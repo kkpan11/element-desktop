@@ -6,21 +6,22 @@ SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Com
 Please see LICENSE files in the repository root for full details.
 */
 
-import { platform } from "node:os";
-
 import { test, expect } from "../../element-desktop-test.js";
 
 declare global {
+    interface ElectronPlatform {
+        getEventIndexingManager():
+            | {
+                  supportsEventIndexing(): Promise<boolean>;
+              }
+            | undefined;
+        getPickleKey(userId: string, deviceId: string): Promise<string | null>;
+        createPickleKey(userId: string, deviceId: string): Promise<string | null>;
+    }
+
     interface Window {
         mxPlatformPeg: {
-            get(): {
-                getEventIndexingManager():
-                    | {
-                          supportsEventIndexing(): Promise<boolean>;
-                      }
-                    | undefined;
-                createPickleKey(userId: string, deviceId: string): Promise<string | null>;
-            };
+            get(): ElectronPlatform;
         };
     }
 }
@@ -46,13 +47,29 @@ test.describe("App launch", () => {
         ).resolves.toBeTruthy();
     });
 
-    test("should launch and render the welcome view successfully and support keytar", async ({ page }) => {
-        test.skip(platform() === "linux", "This test does not yet support Linux");
+    test.describe("safeStorage", () => {
+        const userId = "@user:server";
+        const deviceId = "ABCDEF";
 
-        await expect(
-            page.evaluate<string | null>(async () => {
-                return await window.mxPlatformPeg.get().createPickleKey("@user:server", "ABCDEF");
-            }),
-        ).resolves.not.toBeNull();
+        test("should be supported", async ({ page }) => {
+            await expect(
+                page.evaluate(
+                    ([userId, deviceId]) => window.mxPlatformPeg.get().createPickleKey(userId, deviceId),
+                    [userId, deviceId],
+                ),
+            ).resolves.not.toBeNull();
+        });
+    });
+
+    test.describe("--no-update", () => {
+        test.use({
+            extraArgs: ["--no-update"],
+        });
+
+        // XXX: this test works fine locally but in CI the app start races with the test plumbing up the stdout/stderr pipes
+        // which means the logs are missed, disabling for now.
+        test.skip("should respect option", async ({ page, stdout }) => {
+            expect(stdout.data.toString()).toContain("Auto update disabled via command line flag");
+        });
     });
 });

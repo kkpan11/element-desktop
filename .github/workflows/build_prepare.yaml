@@ -20,6 +20,11 @@ on:
                 required: false
                 default: false
                 description: "Whether the build should be deployed to production"
+            branch-matching:
+                type: boolean
+                required: false
+                default: false
+                description: "Whether the branch name should be matched to find the element-web commit"
         secrets:
             # Required if `nightly` is set
             CF_R2_ACCESS_KEY_ID:
@@ -49,24 +54,54 @@ jobs:
         outputs:
             nightly-version: ${{ steps.versions.outputs.nightly }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+              with:
+                  persist-credentials: false
 
-            - uses: actions/setup-node@v4
+            - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
+            - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
               with:
                   node-version-file: .node-version
-                  cache: "yarn"
+                  cache: "pnpm"
 
             - name: Install Deps
-              run: "yarn install --frozen-lockfile"
+              run: "pnpm install --frozen-lockfile"
 
-            - name: Fetch Element Web
-              run: yarn run fetch --noverify -d ${{ inputs.config }} ${{ inputs.version }}
+            - name: Fetch Element Web (matching branch)
+              id: branch-matching
+              if: inputs.branch-matching
+              continue-on-error: true
+              run: |
+                  scripts/branch-match.sh
+                  cp "$CONFIG_DIR/config.json" element-web/
+                  pnpm --cwd element-web install --frozen-lockfile
+                  pnpm --cwd element-web run build
+                  mv element-web/webapp .
+                  pnpm asar-webapp
+              env:
+                  # These must be set for branch-match.sh to get the right branch
+                  REPOSITORY: ${{ github.repository }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  CONFIG_DIR: ${{ inputs.config }}
+
+            - name: Fetch Element Web (${{ inputs.version }})
+              if: steps.branch-matching.outcome == 'failure' || steps.branch-matching.outcome == 'skipped'
+              run: pnpm run fetch --noverify -d ${CONFIG} ${VERSION}
+              env:
+                  CONFIG: ${{ inputs.config }}
+                  VERSION: ${{ inputs.version }}
+
+            - name: Copy variant config
+              run: cp "$CONFIG_DIR/build.json" variant.json
+              env:
+                  CONFIG_DIR: ${{ inputs.config }}
 
             # We split this out to save the build_* scripts having to do it to make use of `hashFiles` in the cache action
             - name: Generate cache hash files
               run: |
+                  set -ex
                   # Add --no-sandbox as otherwise it fails because the helper isn't setuid root. It's only getting the version.
-                  yarn run --silent electron --no-sandbox --version > electronVersion
+                  pnpm --silent electron --no-sandbox --version > electronVersion
                   cat package.json | jq -c .hakDependencies | sha1sum > hakHash
                   find hak -type f -print0 | xargs -0 sha1sum >> hakHash
                   find scripts/hak -type f -print0 | xargs -0 sha1sum >> hakHash
@@ -80,7 +115,7 @@ jobs:
                   aws s3 cp s3://$R2_BUCKET/debian/dists/default/main/binary-amd64/Packages - --endpoint-url $R2_URL --region auto | grep "Package: element-nightly" -A 50 | grep Version -m1 | sed -n 's/Version: //p' >> VERSIONS
                   aws s3 cp s3://$R2_BUCKET/debian/dists/default/main/binary-arm64/Packages - --endpoint-url $R2_URL --region auto | grep "Package: element-nightly" -A 50 | grep Version -m1 | sed -n 's/Version: //p' >> VERSIONS
                   aws s3 cp s3://$R2_BUCKET/nightly/update/win32/x64/RELEASES - --endpoint-url $R2_URL --region auto | awk '{print $2}' | cut -d "-" -f 5 | cut -c 8- >> VERSIONS
-                  aws s3 cp s3://$R2_BUCKET/nightly/update/win32/ia32/RELEASES - --endpoint-url $R2_URL --region auto | awk '{print $2}' | cut -d "-" -f 5 | cut -c 8- >> VERSIONS
+                  aws s3 cp s3://$R2_BUCKET/nightly/update/win32/arm64/RELEASES - --endpoint-url $R2_URL --region auto | awk '{print $2}' | cut -d "-" -f 5 | cut -c 8- >> VERSIONS
 
                   # Pick the greatest one
                   VERSION=$(cat VERSIONS | sort -uf | tail -n1)
@@ -90,8 +125,6 @@ jobs:
               env:
                   AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
                   AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_TOKEN }}
-                  # Workaround for https://www.cloudflarestatus.com/incidents/t5nrjmpxc1cj
-                  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
                   R2_BUCKET: ${{ vars.R2_BUCKET }}
                   R2_URL: ${{ vars.CF_R2_S3_API }}
 
@@ -103,7 +136,7 @@ jobs:
             - name: "[Release] Fetch release"
               id: release
               if: ${{ !inputs.nightly && inputs.version != 'develop' }}
-              uses: cardinalby/git-get-release-action@cedef2faf69cb7c55b285bad07688d04430b7ada # v1
+              uses: cardinalby/git-get-release-action@5172c3a026600b1d459b117738c605fabc9e4e44 # 1.2.5
               env:
                   GITHUB_TOKEN: ${{ github.token }}
               with:
@@ -131,21 +164,23 @@ jobs:
                   WEB_VERSION=${WEBAPP_VERSION:0:12}
                   JS_VERSION=${WEBAPP_VERSION:16:12}
 
-                  echo "### Nightly build ${{ steps.versions.outputs.nightly }}" >> $GITHUB_STEP_SUMMARY
+                  echo "### Nightly build ${NIGHTLY_VERSION}" >> $GITHUB_STEP_SUMMARY
                   echo "" >> $GITHUB_STEP_SUMMARY
                   echo "| Component   | Version |" >> $GITHUB_STEP_SUMMARY
                   echo "| ----------- | ------- |" >> $GITHUB_STEP_SUMMARY
                   echo "| Bundle Hash | $BUNDLE_HASH |" >> $GITHUB_STEP_SUMMARY
                   echo "| Element Web | [$WEB_VERSION](https://github.com/element-hq/element-web/commit/$WEB_VERSION) |" >> $GITHUB_STEP_SUMMARY
                   echo "| JS SDK      | [$JS_VERSION](https://github.com/matrix-org/matrix-js-sdk/commit/$JS_VERSION) |" >> $GITHUB_STEP_SUMMARY
+              env:
+                  NIGHTLY_VERSION: ${{ steps.versions.outputs.nightly }}
 
-            - uses: actions/upload-artifact@v4
+            - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
               with:
                   name: webapp
                   retention-days: 1
                   path: |
                       webapp.asar
-                      package.json
                       electronVersion
                       hakHash
                       changelog.Debian
+                      variant.json
